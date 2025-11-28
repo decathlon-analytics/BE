@@ -27,49 +27,26 @@
 | **배포** | Render (Backend) / Vercel (Frontend) |
 
 ## 프로젝트 구조
-
+```bash
 decathlon-analytics/
-├── core/ # DB 연결, 환경 변수
-│ ├── config.py
-│ ├── db.py
-├── routers/ # API 엔드포인트
-│ ├── ingest.py # CSV 데이터 적재
-│ ├── analytics.py # 통계 분석
-│ ├── chatbot.py # RAG 챗봇
-│ ├── debug.py
-├── services/ # 비즈니스 로직
-│ ├── ingest.py
-│ ├── utils.py
-│ ├── cards.py
-│ ├── rag_index.py # RAG 인덱스 (gzip 압축)
+├── core/               # DB 연결, 환경 변수
+│   ├── config.py
+│   └── db.py
+├── routers/            # API 엔드포인트
+│   ├── analytics.py    # 통계 분석
+│   ├── chatbot.py      # RAG 챗봇
+│   └── debug.py
+├── services/           # 비즈니스 로직
+│   ├── ingest.py
+│   ├── utils.py
+│   ├── cards.py
+│   └── rag_index.py    # RAG 인덱스
 ├── data/
-│ ├── embeddings.pkl # 임베딩 캐시 (gzip 압축, 42MB)
+│   └── embeddings.pkl  # 임베딩 캐시 (gzip 압축, 42MB)
 ├── main.py
 ├── requirements.txt
 └── .env
-
-text
-
-## 로컬 실행
-
-1. 가상환경 생성
-python -m venv venv
-source venv/bin/activate # Windows: venv\Scripts\activate
-
-2. 패키지 설치
-pip install -r requirements.txt
-
-3. 환경변수 설정 (.env 파일)
-DATABASE_URL=postgresql://user:pass@localhost/decathlon
-OPENAI_API_KEY=sk-...
-
-4. 서버 실행
-uvicorn main:app --reload
-
-5. 임베딩 생성 (최초 1회)
-curl -X POST http://localhost:8000/chatbot/reindex
-
-text
+```
 
 ## 주요 API
 
@@ -105,8 +82,4 @@ text
 
 curl -X POST https://your-api.com/chatbot/reindex
 
-text
 
-## 라이센스
-
-MIT
