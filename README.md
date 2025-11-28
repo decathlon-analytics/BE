@@ -1,3 +1,5 @@
+기존 레포에 오류가 생겨서 새로 커밋했습니다.
+
 # Decathlon Analytics Backend
 
 **Decathlon Korea 제품 리뷰 데이터 분석 및 RAG 기반 챗봇 백엔드 시스템**
