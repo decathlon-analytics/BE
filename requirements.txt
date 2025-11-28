@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pandas
+pydantic
+python-multipart
+psycopg2-binary       # ← PostgreSQL 드라이버
+python-dotenv         # ← .env 사용 시
+openai
+requests
+numpy
