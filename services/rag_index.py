@@ -15,6 +15,9 @@ PKL_PATH = os.environ.get("RAG_EMB_PATH", "data/embeddings.pkl")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# 전역 캐시 추가
+_INDEX_CACHE = None
+
 # ======== 유틸리티 ========
 def _basic_clean(text_: str) -> str:
     if not isinstance(text_, str): return ""
@@ -58,8 +61,22 @@ def _classify_item_type(name: str) -> str:
         return "장갑"
     return "기타"
 
+def _load_index():
+    """전역 캐싱으로 메모리 절약"""
+    global _INDEX_CACHE
+    if _INDEX_CACHE is None:
+        if not os.path.exists(PKL_PATH):
+            return None
+        with gzip.open(PKL_PATH, "rb") as f:
+            _INDEX_CACHE = pickle.load(f)
+    return _INDEX_CACHE
+
 # ======== 통합 인덱스 빌드 (리뷰 + 상품정보) ========
 def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int = 128) -> Dict[str, Any]:
+    
+    global _INDEX_CACHE
+    _INDEX_CACHE = None  # 캐시 초기화
+    
     # 1. 리뷰 데이터
     review_df = pd.read_sql(text("""
         SELECT
@@ -185,12 +202,10 @@ def hybrid_search(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    if not os.path.exists(PKL_PATH):
-        return []
     
-    # gzip 압축 해제
-    with gzip.open(PKL_PATH, "rb") as f:
-        idx = pickle.load(f)
+    idx = _load_index()
+    if not idx:
+        return []
     
     q_emb = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=query).data[0].embedding
     q_vec = np.array(q_emb)
@@ -340,12 +355,10 @@ def recommend_level_set(level: str, category: str, db: Session) -> Dict[str, Any
 # ======== 메타 ========
 def index_meta() -> Dict[str, Any]:
     try:
-        if not os.path.exists(PKL_PATH):
+        idx = _load_index()
+        if not idx:
             return {"error": "Index not found", "path": PKL_PATH}
-        
-        with gzip.open(PKL_PATH, "rb") as f:
-            idx = pickle.load(f)
-        
+
         return {
             "review_chunks": len(idx.get("review_docs", [])),
             "info_chunks": len(idx.get("info_docs", [])),
