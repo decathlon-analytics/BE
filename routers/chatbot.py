@@ -350,11 +350,10 @@ def chat(
     # ======== 4. 후속 질문 ========
     if intent == "followup":
         last_ids = _get_last_recommended_ids(db, session_id)
-        offset = len(last_ids)
         
-        # 마지막 검색 쿼리가 있으면 재사용 (간소화: 여기선 현재 쿼리 사용)
         try:
-            results = hybrid_search(req.message, top_k=1, offset=offset)
+            # offset 대신 exclude_ids 사용
+            results = hybrid_search(req.message, top_k=1, exclude_ids=last_ids)
         except:
             results = []
         
@@ -364,7 +363,9 @@ def chat(
         else:
             product = results[0]
             price_str = f"{product.get('price'):,}원" if product.get('price') else "가격 미정"
-            answer = f"{offset+1}번째 추천: {product['name']} ({price_str})"
+            
+            # 번호 대신 자연스러운 표현
+            answer = f"다른 제품도 있습니다. {product['name']} ({price_str})는 어떠세요?"
             
             recs = [{
                 "product_id": product["product_id"],
@@ -381,6 +382,7 @@ def chat(
                 "top_reviews": [{"text": product.get("review_snippet", ""), "rating": product.get("rating")}]
             }]
             
+            # 새 제품 추가
             new_ids = last_ids + [product["product_id"]]
             _save_recommended_ids(db, session_id, new_ids)
         
@@ -390,8 +392,7 @@ def chat(
         return ChatOut(answer=answer, recommendations=recs, meta={
             "latency_ms": int((time.time() - t0) * 1000),
             "route": intent,
-            "has_more": len(results) > 0,
-            "offset": offset + 1
+            "has_more": len(results) > 0
         }, session_id=session_id)
     
     # ======== 5. 일반 추천 ========

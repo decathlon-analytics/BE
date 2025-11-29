@@ -198,11 +198,10 @@ def hybrid_search(
     query: str,
     top_k: int = 3,
     *,
-    offset: int = 0,
+    exclude_ids: List[str] = None,  # offset 대신 이걸로
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    
     idx = _load_index()
     if not idx:
         return []
@@ -210,16 +209,19 @@ def hybrid_search(
     q_emb = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=query).data[0].embedding
     q_vec = np.array(q_emb)
     
-    # 1. 상품정보 검색 (60%)
     info_results = []
     if idx.get("info_embeddings"):
-        info_embs = np.array(idx["info_embeddings"])
-        sims = _cosine_sim(q_vec, info_embs)
-        for i, s in enumerate(sims):
+        # numpy 변환 없이 직접 계산
+        info_embs = idx["info_embeddings"]  # list 그대로
+        
+        for i, emb in enumerate(info_embs):
+            emb_vec = np.array(emb, dtype=np.float32)
+            sim = np.dot(q_vec, emb_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(emb_vec) + 1e-12)
+            
             d = idx["info_docs"][i]
             info_results.append({
                 "product_id": d["product_id"],
-                "score": float(s) * 0.6,
+                "score": float(sim) * 0.6,
                 "name": d["name"],
                 "price": d["price"],
                 "rating": d["rating"],
@@ -232,16 +234,19 @@ def hybrid_search(
                 "info_snippet": d["text"][:200],
             })
     
-    # 2. 리뷰 검색 (40%)
+    # 리뷰도 동일
     review_results = []
     if idx.get("review_embeddings"):
-        review_embs = np.array(idx["review_embeddings"])
-        sims = _cosine_sim(q_vec, review_embs)
-        for i, s in enumerate(sims):
+        review_embs = idx["review_embeddings"]
+        
+        for i, emb in enumerate(review_embs):
+            emb_vec = np.array(emb, dtype=np.float32)
+            sim = np.dot(q_vec, emb_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(emb_vec) + 1e-12)
+            
             d = idx["review_docs"][i]
             review_results.append({
                 "product_id": d["product_id"],
-                "score": float(s) * 0.4,
+                "score": float(sim) * 0.4,
                 "review_snippet": d["text"][:150],
             })
     
@@ -259,16 +264,19 @@ def hybrid_search(
     
     # 4. 가격 필터
     filtered = []
+    exclude_set = set(exclude_ids or [])
+    
     for pid, data in merged.items():
+        if pid in exclude_set:  # 이미 추천한 제품 제외
+            continue
+        
         price = data.get("price")
         if min_price and (not price or price < min_price): continue
         if max_price and (not price or price > max_price): continue
         filtered.append(data)
     
-    # 5. 정렬 + 오프셋
+    # 5. 정렬
     filtered.sort(key=lambda x: x["score"], reverse=True)
-    if offset > 0:
-        filtered = filtered[offset:]
     filtered = filtered[:top_k]
     
     return filtered
