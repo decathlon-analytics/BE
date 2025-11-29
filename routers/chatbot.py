@@ -1,4 +1,4 @@
-# routers/chatbot.py (완전 개선 버전)
+# routers/chatbot.py (최종 수정)
 from fastapi import APIRouter, Depends, Request, Response, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -10,19 +10,17 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from core.db import get_db
 
-from services.rag_index import hybrid_search, search_by_model_id, recommend_level_set, index_meta
+from services.rag_index import hybrid_search, search_by_model_id, search_by_name_fast, recommend_level_set, index_meta
 from openai import OpenAI
 
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 
-# 환경
 ENV = os.getenv("ENV", "dev").lower()
 COOKIE_NAME = "session_id"
 SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# 스키마
 class ChatIn(BaseModel):
     message: str
 
@@ -33,7 +31,6 @@ class ChatOut(BaseModel):
     meta: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = None
 
-# ======== 세션 관리 (개선) ========
 def _set_session_cookie(response: Response, sid: str):
     secure = (ENV == "prod")
     samesite = "none" if secure else "lax"
@@ -67,7 +64,6 @@ def _ensure_session(request: Request, response: Response, db: Session) -> str:
         db.execute(upsert_sql, {"id": sid, "exp": exp})
         db.commit()
     except Exception as e:
-        # 테이블 없을 때 방어
         from core.db import ensure_tables
         ensure_tables()
         db.execute(upsert_sql, {"id": sid, "exp": exp})
@@ -99,7 +95,6 @@ def _save_message(db, session_id, role, content, meta=None):
     db.commit()
 
 def _get_last_recommended_ids(db, session_id) -> List[str]:
-    """세션에 저장된 마지막 추천 제품 ID 목록"""
     try:
         row = db.execute(text("SELECT last_recommended_ids FROM sessions WHERE id=:sid"), {"sid": session_id}).first()
         if not row or not row[0]: return []
@@ -108,7 +103,6 @@ def _get_last_recommended_ids(db, session_id) -> List[str]:
         return []
 
 def _save_recommended_ids(db, session_id, product_ids: List[str]):
-    """추천한 제품 ID들을 세션에 저장"""
     ids_str = ",".join([str(x) for x in product_ids if x])
     try:
         db.execute(text("UPDATE sessions SET last_recommended_ids=:ids WHERE id=:sid"), {"ids": ids_str, "sid": session_id})
@@ -116,44 +110,89 @@ def _save_recommended_ids(db, session_id, product_ids: List[str]):
     except:
         pass
 
-# ======== 개선된 인텐트 분류 ========
+def _get_last_user_query(history: List[Dict[str, str]]) -> str:
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if not any(k in content.lower() for k in ["다른", "더", "또", "추가"]):
+                return content
+    return ""
+
+def _get_last_product_type(db, session_id) -> str:
+    try:
+        ids = _get_last_recommended_ids(db, session_id)
+        if not ids:
+            return ""
+        
+        row = db.execute(text("""
+            SELECT product_name, category 
+            FROM product_summary 
+            WHERE product_id = :pid
+        """), {"pid": ids[0]}).mappings().first()
+        
+        if not row:
+            return ""
+        
+        name = row["product_name"] or ""
+        
+        if any(k in name.lower() for k in ["티", "자켓", "재킷", "베스트", "상의"]):
+            return "상의"
+        elif any(k in name.lower() for k in ["바지", "쇼츠", "팬츠", "레깅스", "하의"]):
+            return "하의"
+        elif any(k in name.lower() for k in ["러닝화", "등산화", "슈즈", "신발"]):
+            return "신발"
+        elif "가방" in name.lower() or "백팩" in name.lower():
+            return "가방"
+        
+        return row.get("category", "")
+    except:
+        return ""
+
+def _detect_gender(query: str) -> str:
+    q = query.lower()
+    if any(k in q for k in ["여성", "여자", "우먼", "woman", "레이디"]):
+        return "female"
+    elif any(k in q for k in ["남성", "남자", "맨", "man"]):
+        return "male"
+    return "neutral"
+
 def _classify_intent(query: str, history: List[Dict]) -> str:
-    """
-    우선순위:
-    1. 모델번호 (7자리 숫자)
-    2. 세트/레벨 요청
-    3. 후속 질문
-    4. 스몰톡
-    5. 일반 추천
-    """
     q = query.lower()
     
     # 1순위: 모델번호
     if re.search(r"\b\d{7}\b", q):
         return "model_search"
     
-    # 2순위: 세트 요청 (강화!)
+    # 2순위: 세트 요청 (명확하게)
     set_keywords = ["세트", "풀세트", "조합", "구성", "셋트", "패키지", "set"]
-    level_keywords = ["초심자", "중급자", "고수", "입문", "비기너", "프로", "상급", "초보", "100", "500", "900"]
+    level_keywords = ["초심자", "중급자", "고수", "입문", "비기너", "프로", "상급", "초보"]
     
-    # 세트 또는 레벨 키워드 → 무조건 세트 모드
     if any(k in q for k in set_keywords):
         return "level_set"
-    if any(k in q for k in level_keywords) and any(k2 in q for k2 in ["추천", "알려", "찾아"]):
+    
+    # "100/500/900 추천" or "초심자 추천" → 세트
+    if any(k in q for k in level_keywords) and "추천" in q:
         return "level_set"
     
-    # 3순위: 후속 질문
+    # "100 알려줘" (단독 레벨만) → 세트
+    if re.search(r"\b(100|500|900)\b", q) and not any(k in q for k in ["티", "자켓", "바지", "신발", "러닝", "하이킹"]):
+        if any(k in q for k in ["추천", "알려", "찾아"]):
+            return "level_set"
+    
+    # 3순위: 인기 제품
+    if any(k in q for k in ["인기", "베스트", "best", "top", "많이 팔리는", "잘 나가는", "요즘"]):
+        return "popular"
+    
+    # 4순위: 후속 질문
     if any(k in q for k in ["다른", "또", "더", "그 외", "다른거", "다른 거", "하나 더", "추가"]):
         return "followup"
     
-    # 4순위: 스몰톡
+    # 5순위: 스몰톡
     if any(k in q for k in ["안녕", "하이", "ㅎㅇ", "고마워", "감사", "땡큐", "thank"]):
         return "greeting"
     
-    # 기본: 일반 추천
     return "recommendation"
 
-# ======== LLM 호출 ========
 def _call_llm(system_prompt: str, messages: List[Dict[str, str]]) -> str:
     try:
         comp = client.chat.completions.create(
@@ -172,7 +211,6 @@ SYSTEM_PROMPT = (
     "제품명, 가격, 핵심 특징 1~2개를 자연스럽게 포함하세요."
 )
 
-# ======== Routes ========
 @router.get("/health")
 def health():
     try:
@@ -197,20 +235,21 @@ def chat(
 ):
     t0 = time.time()
     session_id = _ensure_session(request, response, db)
-    history = _load_recent_context(db, session_id, limit_turns=6)
+    history = _load_recent_context(db, session_id, limit_turns=10)
     
-    # 인텐트 분류
     intent = _classify_intent(req.message, history)
+    gender = _detect_gender(req.message)
     
     # ======== 1. 스몰톡 ========
     if intent == "greeting":
         if any(k in req.message.lower() for k in ["안녕", "하이", "ㅎㅇ", "hello"]):
             answer = (
-                "안녕하세요! 데카트론 제품 추천 챗봇입니다 \n\n"
+                "안녕하세요! 데카트론 제품 추천 챗봇입니다.\n\n"
                 "예시 질문:\n"
-                "• '초심자용 러닝 세트 추천해줘'\n"
-                "• '방수 자켓 찾아줘'\n"
-                "• '8751038 제품 알려줘'\n\n"
+                "• '러닝화 추천해줘'\n"
+                "• '가벼운 겨울 자켓'\n"
+                "• '요즘 인기있는 제품'\n"
+                "• '초심자용 러닝 세트'\n\n"
                 "※ 데카트론 제품 관련 질문만 답변 가능합니다."
             )
         else:
@@ -236,13 +275,14 @@ def chat(
         else:
             price_str = f"{product.get('price'):,}원" if product.get('price') else "가격 미정"
             answer = (
+                f"네! 제품을 찾았습니다.\n\n"
                 f"{product['name']}\n\n"
                 f"가격: {price_str}\n"
                 f"평점: {product.get('rating', 0)}/5.0 (리뷰 {product.get('review_count', 0)}개)"
             )
             
             if product.get("explanation"):
-                answer += f"\n\n {product['explanation'][:150]}..."
+                answer += f"\n\n{product['explanation'][:150]}..."
             
             recs = [{
                 "product_id": product["product_id"],
@@ -269,23 +309,83 @@ def chat(
             "exact_match": True
         }, session_id=session_id)
     
-    # ======== 3. 레벨 세트 추천 (핵심 개선!) ========
+    # ======== 3. 인기 제품 추천 ========
+    if intent == "popular":
+        last_ids = _get_last_recommended_ids(db, session_id)
+        
+        gender_filter = ""
+        if gender == "female":
+            gender_filter = "AND ps.product_name LIKE '여성%'"
+        elif gender == "male":
+            gender_filter = "AND ps.product_name LIKE '남성%'"
+        else:
+            gender_filter = "AND ps.product_name NOT LIKE '여성%'"
+        
+        exclude_filter = ""
+        if last_ids:
+            exclude_list = "','".join(last_ids)
+            exclude_filter = f"AND ps.product_id NOT IN ('{exclude_list}')"
+        
+        sql = text(f"""
+            SELECT 
+                ps.product_id, ps.product_name, ps.price, ps.avg_rating,
+                ps.total_reviews, ps.url, ps.thumbnail_url, ps.category,
+                pi.explanation, pi.technical_info, pi.management_guidelines
+            FROM product_summary ps
+            LEFT JOIN product_information pi USING (product_id)
+            WHERE ps.total_reviews > 0
+            {gender_filter}
+            {exclude_filter}
+            ORDER BY ps.total_reviews DESC, ps.avg_rating DESC
+            LIMIT 1
+        """)
+        
+        row = db.execute(sql).mappings().first()
+        
+        if not row:
+            answer = "더 이상 추천할 인기 제품이 없습니다."
+            recs = None
+        else:
+            answer = f"네! 가장 인기 있는 제품을 추천해드리겠습니다.\n\n{row['product_name']} (리뷰 {row['total_reviews']}개)"
+            
+            recs = [{
+                "product_id": row["product_id"],
+                "name": row["product_name"],
+                "price": row.get("price"),
+                "rating": row.get("avg_rating"),
+                "review_count": row.get("total_reviews"),
+                "link": row.get("url"),
+                "product_info": {
+                    "explanation": row.get("explanation"),
+                    "technical_info": row.get("technical_info"),
+                    "management": row.get("management_guidelines"),
+                }
+            }]
+            
+            new_ids = last_ids + [row["product_id"]]
+            _save_recommended_ids(db, session_id, new_ids)
+        
+        _save_message(db, session_id, "user", req.message, meta={"route": intent})
+        _save_message(db, session_id, "assistant", answer, meta={"route": intent})
+        
+        return ChatOut(answer=answer, recommendations=recs, meta={
+            "latency_ms": int((time.time() - t0) * 1000),
+            "route": intent,
+            "has_more": False
+        }, session_id=session_id)
+    
+    # ======== 4. 레벨 세트 추천 ========
     if intent == "level_set":
-        # 레벨 추출 (기본값 100)
-        level = "100"  # ← 기본값!
+        level = "100"
         if any(k in req.message.lower() for k in ["중급", "500", "레귤러", "중간"]):
             level = "500"
         elif any(k in req.message.lower() for k in ["고수", "상급", "900", "프로", "고급", "전문"]):
             level = "900"
-        elif any(k in req.message.lower() for k in ["초심자", "입문", "100", "비기너", "초보", "beginner"]):
-            level = "100"
         
-        # 카테고리 추출 (기본값 RUNNING)
         category = "RUNNING"
         if any(k in req.message for k in ["하이킹", "등산", "트레킹", "hiking"]):
             category = "HIKING"
         
-        # 세트 조회
         try:
             result = recommend_level_set(level, category, db)
             items = result["items"]
@@ -300,10 +400,9 @@ def chat(
                 "error": str(e)
             }, session_id=session_id)
         
-        # 최소 2개는 있어야 세트!
         if not items or len(items) < 2:
             answer = (
-                f"{level} 레벨 세트 구성이 어렵습니다.\n"
+                f"네! 하지만 {level} 레벨 세트 구성이 어렵습니다.\n"
                 f"단일 제품 추천으로 전환하시겠어요? '러닝화 추천'처럼 구체적으로 물어보세요."
             )
             recs = None
@@ -313,19 +412,18 @@ def chat(
             cat_kr = {"RUNNING": "러닝", "HIKING": "하이킹"}[category]
             
             answer = (
-                f"{level_kr}용 {cat_kr} 세트를 추천드립니다!\n\n"
+                f"네! {level_kr}용 {cat_kr} 세트를 추천해드리겠습니다!\n\n"
                 f"구성: {', '.join(set_info['item_types'])}\n"
                 f"총 가격: {set_info['total_price']:,}원"
             )
             
             recs = []
             for item in items:
-                price_val = item.get("price")
                 recs.append({
                     "type": item.get("type", "기타"),
                     "product_id": item["product_id"],
                     "name": item["name"],
-                    "price": price_val if price_val else 0,
+                    "price": item.get("price", 0),
                     "rating": item.get("rating"),
                     "review_count": item.get("review_count", 0),
                     "link": item.get("url"),
@@ -347,44 +445,54 @@ def chat(
             "has_more": False
         }, session_id=session_id)
     
-    # ======== 4. 후속 질문 ========
+    # ======== 5. 후속 질문 ========
     if intent == "followup":
+        last_query = _get_last_user_query(history)
+        last_type = _get_last_product_type(db, session_id)
         last_ids = _get_last_recommended_ids(db, session_id)
         
-        try:
-            # offset 대신 exclude_ids 사용
-            results = hybrid_search(req.message, top_k=1, exclude_ids=last_ids)
-        except:
-            results = []
-        
-        if not results:
-            answer = "더 이상 추천할 제품이 없습니다. 새로운 검색어로 다시 물어보세요."
+        if not last_query:
+            answer = "이전 추천 기록이 없습니다. 먼저 제품을 검색해주세요."
             recs = None
         else:
-            product = results[0]
-            price_str = f"{product.get('price'):,}원" if product.get('price') else "가격 미정"
+            try:
+                last_gender = _detect_gender(last_query)
+                
+                search_query = last_query
+                if last_type:
+                    search_query = f"{last_type} {last_query}"
+                
+                results = hybrid_search(search_query, top_k=5, exclude_ids=last_ids, gender_filter=last_gender)
+            except Exception as e:
+                print(f"followup error: {e}")
+                results = []
             
-            # 번호 대신 자연스러운 표현
-            answer = f"다른 제품도 있습니다. {product['name']} ({price_str})는 어떠세요?"
-            
-            recs = [{
-                "product_id": product["product_id"],
-                "name": product["name"],
-                "price": product.get("price"),
-                "rating": product.get("rating"),
-                "review_count": product.get("review_count"),
-                "link": product.get("url"),
-                "product_info": {
-                    "explanation": product.get("explanation") or product.get("info_snippet", ""),
-                    "technical_info": product.get("technical_info"),
-                    "management": product.get("management"),
-                },
-                "top_reviews": [{"text": product.get("review_snippet", ""), "rating": product.get("rating")}]
-            }]
-            
-            # 새 제품 추가
-            new_ids = last_ids + [product["product_id"]]
-            _save_recommended_ids(db, session_id, new_ids)
+            if not results:
+                answer = "더 이상 추천할 제품이 없습니다. 새로운 검색어로 다시 물어보세요."
+                recs = None
+            else:
+                import random
+                product = random.choice(results)
+                price_str = f"{product.get('price'):,}원" if product.get('price') else "가격 미정"
+                answer = f"네! 다른 제품도 있습니다. {product['name']} ({price_str})는 어떠세요?"
+                
+                recs = [{
+                    "product_id": product["product_id"],
+                    "name": product["name"],
+                    "price": product.get("price"),
+                    "rating": product.get("rating"),
+                    "review_count": product.get("review_count"),
+                    "link": product.get("url"),
+                    "product_info": {
+                        "explanation": product.get("explanation") or product.get("info_snippet", ""),
+                        "technical_info": product.get("technical_info"),
+                        "management": product.get("management"),
+                    },
+                    "top_reviews": [{"text": product.get("review_snippet", ""), "rating": product.get("rating")}]
+                }]
+                
+                new_ids = last_ids + [product["product_id"]]
+                _save_recommended_ids(db, session_id, new_ids)
         
         _save_message(db, session_id, "user", req.message, meta={"route": intent})
         _save_message(db, session_id, "assistant", answer, meta={"route": intent})
@@ -392,12 +500,88 @@ def chat(
         return ChatOut(answer=answer, recommendations=recs, meta={
             "latency_ms": int((time.time() - t0) * 1000),
             "route": intent,
-            "has_more": len(results) > 0
+            "has_more": bool(results) if 'results' in locals() else False
         }, session_id=session_id)
     
-    # ======== 5. 일반 추천 ========
+     # ======== 6. 일반 추천 (제품명 우선 검색) ========
+    product_match = search_by_name_fast(req.message, db)
+    
+    if product_match:
+        price_str = f"{product_match.get('price'):,}원" if product_match.get('price') else "가격 미정"
+        answer = (
+            f"네! 제품을 찾았습니다.\n\n"
+            f"{product_match['name']}\n\n"
+            f"가격: {price_str}\n"
+            f"평점: {product_match.get('rating', 0)}/5.0 (리뷰 {product_match.get('review_count', 0)}개)"
+        )
+        
+        if product_match.get("explanation"):
+            answer += f"\n\n{product_match['explanation'][:150]}..."
+        
+        recs = [{
+            "product_id": product_match["product_id"],
+            "name": product_match["name"],
+            "price": product_match.get("price"),
+            "rating": product_match.get("rating"),
+            "review_count": product_match.get("review_count"),
+            "link": product_match.get("url"),
+            "product_info": {
+                "explanation": product_match.get("explanation"),
+                "technical_info": product_match.get("technical_info"),
+                "management": product_match.get("management"),
+            }
+        }]
+        _save_recommended_ids(db, session_id, [product_match["product_id"]])
+        
+        _save_message(db, session_id, "user", req.message, meta={"route": "product_name_match"})
+        _save_message(db, session_id, "assistant", answer, meta={"route": "product_name_match"})
+        
+        return ChatOut(answer=answer, recommendations=recs, meta={
+            "latency_ms": int((time.time() - t0) * 1000),
+            "route": "product_name_match",
+            "has_more": False,
+            "exact_match": True
+        }, session_id=session_id)
+    
+    # 데카트론 제품 관련 키워드 체크
+    product_keywords = [
+        # 제품 카테고리
+        "러닝", "하이킹", "등산", "자전거", "수영", "요가", "헬스", "축구", "농구", "배드민턴",
+        # 제품 타입
+        "신발", "화", "슈즈", "티", "자켓", "재킷", "바지", "팬츠", "쇼츠", "레깅스", "가방", "백팩",
+        "모자", "장갑", "양말", "선글라스", "시계", "텐트", "침낭", "매트", "배낭",
+        # 일반 키워드
+        "운동", "스포츠", "아웃도어", "트레이닝", "피트니스", "decathlon", "데카트론",
+        "추천", "제품", "상품", "구매", "찾", "알려"
+    ]
+    
+    q_lower = req.message.lower()
+    has_product_keyword = any(k in q_lower for k in product_keywords)
+    
+    if not has_product_keyword:
+        answer = (
+            "죄송합니다. 데카트론 스포츠 용품과 관련된 질문을 입력해주세요.\n\n"
+            "예시:\n"
+            "• '러닝화 추천해줘'\n"
+            "• '방수 자켓 찾아줘'\n"
+            "• '초심자용 요가 매트'\n"
+            "• '8926414 제품 정보'\n\n"
+            "데카트론 제품 관련 질문만 답변 가능합니다."
+        )
+        recs = None
+        
+        _save_message(db, session_id, "user", req.message, meta={"route": "non_product_query"})
+        _save_message(db, session_id, "assistant", answer, meta={"route": "non_product_query"})
+        
+        return ChatOut(answer=answer, recommendations=None, meta={
+            "latency_ms": int((time.time() - t0) * 1000),
+            "route": "non_product_query",
+            "has_more": False
+        }, session_id=session_id)
+    
+    # 임베딩 검색
     try:
-        results = hybrid_search(req.message, top_k=3)
+        results = hybrid_search(req.message, top_k=5, gender_filter=gender)
     except Exception as e:
         answer = f"검색 중 오류가 발생했습니다: {str(e)}"
         _save_message(db, session_id, "user", req.message, meta={"route": intent, "error": str(e)})
@@ -408,13 +592,20 @@ def chat(
             "error": str(e)
         }, session_id=session_id)
     
-    if not results:
-        answer = "요청과 맞는 제품을 찾기 어렵네요. 카테고리(러닝/하이킹)나 예산을 조금 더 알려주세요."
+    # 유사도 점수 체크 (너무 낮으면 제품 못찾음)
+    if not results or (results and results[0].get("score", 0) < 0.3):
+        answer = (
+            "죄송합니다. 요청하신 조건에 맞는 제품을 찾을 수 없습니다.\n\n"
+            "다음과 같이 질문해주세요:\n"
+            "• 모델번호: '8926414'\n"
+            "• 제품명: '남성 러닝 윈드 자켓 런 100'\n"
+            "• 카테고리: '러닝화 추천', '방수 자켓'\n"
+            "• 세트: '초심자용 러닝 세트', '500 세트'"
+        )
         recs = None
     else:
-        top = results[0]
-        
-        # 상품정보 우선, 없으면 리뷰 스니펫
+        import random
+        top = random.choice(results)
         explanation = top.get('explanation') or top.get('info_snippet', '')
         review = top.get('review_snippet', '')
         
@@ -425,30 +616,28 @@ def chat(
             f"- 가격: {top.get('price', '미정')}원\n"
             f"- 설명: {explanation[:200]}\n"
             f"- 리뷰: {review}\n\n"
-            f"2~3문장으로 간단히 추천 사유를 설명하세요."
+            f"'네! 제품 추천해드리겠습니다'로 시작하여 2~3문장으로 간단히 추천 사유를 설명하세요."
         )
         
         llm_messages = [{"role": "user", "content": prompt}]
         answer = _call_llm(SYSTEM_PROMPT, llm_messages)
         
-        recs = []
-        for r in results:
-            recs.append({
-                "product_id": r["product_id"],
-                "name": r["name"],
-                "price": r.get("price"),
-                "rating": r.get("rating"),
-                "review_count": r.get("review_count"),
-                "link": r.get("url"),
-                "product_info": {
-                    "explanation": r.get("explanation") or r.get("info_snippet", ""),
-                    "technical_info": r.get("technical_info"),
-                    "management": r.get("management"),
-                },
-                "top_reviews": [{"text": r.get("review_snippet", ""), "rating": r.get("rating")}]
-            })
+        recs = [{
+            "product_id": top["product_id"],
+            "name": top["name"],
+            "price": top.get("price"),
+            "rating": top.get("rating"),
+            "review_count": top.get("review_count"),
+            "link": top.get("url"),
+            "product_info": {
+                "explanation": top.get("explanation") or top.get("info_snippet", ""),
+                "technical_info": top.get("technical_info"),
+                "management": top.get("management"),
+            },
+            "top_reviews": [{"text": top.get("review_snippet", ""), "rating": top.get("rating")}]
+        }]
         
-        _save_recommended_ids(db, session_id, [r["product_id"] for r in results])
+        _save_recommended_ids(db, session_id, [top["product_id"]])
     
     _save_message(db, session_id, "user", req.message, meta={"route": intent})
     _save_message(db, session_id, "assistant", answer, meta={"route": intent})
@@ -456,5 +645,5 @@ def chat(
     return ChatOut(answer=answer, recommendations=recs, meta={
         "latency_ms": int((time.time() - t0) * 1000),
         "route": intent,
-        "has_more": len(results) > 0
+        "has_more": len(results) > 1 if results else False
     }, session_id=session_id)

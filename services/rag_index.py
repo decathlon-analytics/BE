@@ -1,4 +1,4 @@
-# services/rag_index.py (gzip 압축 버전)
+# services/rag_index.py
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
 import os, re, pickle, gzip
@@ -10,15 +10,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from openai import OpenAI
 
-# 환경설정
 PKL_PATH = os.environ.get("RAG_EMB_PATH", "data/embeddings.pkl")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# 전역 캐시 추가
 _INDEX_CACHE = None
 
-# ======== 유틸리티 ========
 def _basic_clean(text_: str) -> str:
     if not isinstance(text_, str): return ""
     t = text_.strip()
@@ -42,7 +39,6 @@ def _cosine_sim(query_vec: np.ndarray, mat: np.ndarray) -> np.ndarray:
 def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-# ======== 제품 타입/레벨 추출 ========
 def _extract_level(name: str) -> Optional[str]:
     if not name: return None
     m = re.search(r"\b(100|500|900)\b", name)
@@ -61,8 +57,41 @@ def _classify_item_type(name: str) -> str:
         return "장갑"
     return "기타"
 
+
+def _match_product_type(name: str, query: str) -> bool:
+    """제품명이 쿼리 의도와 맞는지 확인"""
+    name_lower = name.lower()
+    query_lower = query.lower()
+    
+    # 상의 키워드
+    if any(k in query_lower for k in ["상의", "티", "티셔츠", "자켓", "재킷", "베스트"]):
+        if any(k in name_lower for k in ["티", "자켓", "재킷", "베스트", "싱글렛", "탱크탑"]):
+            if not any(k in name_lower for k in ["바지", "쇼츠", "팬츠", "레깅스"]):
+                return True
+        return False
+    
+    # 하의 키워드
+    if any(k in query_lower for k in ["하의", "바지", "쇼츠", "팬츠", "레깅스"]):
+        if any(k in name_lower for k in ["바지", "쇼츠", "팬츠", "레깅스"]):
+            return True
+        return False
+    
+    # 신발 키워드
+    if any(k in query_lower for k in ["신발", "운동화", "러닝화", "등산화", "슈즈"]):
+        if any(k in name_lower for k in ["화", "슈즈", "신발"]):
+            return True
+        return False
+    
+    # 가방 키워드
+    if any(k in query_lower for k in ["가방", "백팩", "배낭"]):
+        if any(k in name_lower for k in ["가방", "백팩", "배낭"]):
+            return True
+        return False
+    
+    # 특정 키워드 없으면 통과
+    return True
+
 def _load_index():
-    """전역 캐싱으로 메모리 절약"""
     global _INDEX_CACHE
     if _INDEX_CACHE is None:
         if not os.path.exists(PKL_PATH):
@@ -71,24 +100,31 @@ def _load_index():
             _INDEX_CACHE = pickle.load(f)
     return _INDEX_CACHE
 
-# ======== 통합 인덱스 빌드 (리뷰 + 상품정보) ========
 def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int = 128) -> Dict[str, Any]:
-    
     global _INDEX_CACHE
-    _INDEX_CACHE = None  # 캐시 초기화
+    _INDEX_CACHE = None
     
-    # 1. 리뷰 데이터
     review_df = pd.read_sql(text("""
-        SELECT
-            r.product_id,
-            COALESCE(r.category, ps.category) AS category,
-            COALESCE(r.product_name, ps.product_name) AS name,
-            ps.price, ps.avg_rating, ps.total_reviews,
-            ps.url, ps.thumbnail_url,
-            r.review_text
-        FROM reviews r
-        LEFT JOIN product_summary ps USING (product_id)
-        WHERE r.review_text IS NOT NULL AND length(r.review_text) >= 10
+        WITH ranked_reviews AS (
+            SELECT
+                r.product_id,
+                COALESCE(r.category, ps.category) AS category,
+                COALESCE(r.product_name, ps.product_name) AS name,
+                ps.price, ps.avg_rating, ps.total_reviews,
+                ps.url, ps.thumbnail_url,
+                r.review_text,
+                r.rating,
+                ROW_NUMBER() OVER (
+                    PARTITION BY r.product_id 
+                    ORDER BY r.rating DESC, length(r.review_text) DESC
+                ) as rn
+            FROM reviews r
+            LEFT JOIN product_summary ps USING (product_id)
+            WHERE r.review_text IS NOT NULL 
+              AND length(r.review_text) >= 15
+              AND r.rating >= 4.0
+        )
+        SELECT * FROM ranked_reviews WHERE rn <= 5
     """), db.bind)
     
     if limit:
@@ -113,7 +149,6 @@ def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int 
         })
         review_texts.append(r.get("clean_text"))
     
-    # 2. 상품정보 데이터
     info_df = pd.read_sql(text("""
         SELECT
             pi.product_id,
@@ -159,7 +194,6 @@ def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int 
         })
         info_texts.append(r.get("combined_text"))
     
-    # 3. 임베딩 생성
     all_texts = review_texts + info_texts
     all_embeddings = []
     for i in range(0, len(all_texts), batch):
@@ -167,11 +201,9 @@ def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int 
         resp = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=chunk)
         all_embeddings.extend([d.embedding for d in resp.data])
     
-    # 4. 분리
     review_embeddings = all_embeddings[:len(review_texts)]
     info_embeddings = all_embeddings[len(review_texts):]
     
-    # 5. gzip 압축 저장
     os.makedirs(os.path.dirname(PKL_PATH) or ".", exist_ok=True)
     payload = {
         "review_embeddings": review_embeddings,
@@ -193,12 +225,12 @@ def build_index_from_db(db: Session, *, limit: Optional[int] = None, batch: int 
         "path": PKL_PATH
     }
 
-# ======== 하이브리드 검색 ========
 def hybrid_search(
     query: str,
     top_k: int = 3,
     *,
-    exclude_ids: List[str] = None,  # offset 대신 이걸로
+    exclude_ids: List[str] = None,
+    gender_filter: str = "neutral",  # "male", "female", "neutral"
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
@@ -207,22 +239,23 @@ def hybrid_search(
         return []
     
     q_emb = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=query).data[0].embedding
-    q_vec = np.array(q_emb)
+    q_vec = np.array(q_emb, dtype=np.float32)
     
     info_results = []
     if idx.get("info_embeddings"):
-        # numpy 변환 없이 직접 계산
-        info_embs = idx["info_embeddings"]  # list 그대로
-        
-        for i, emb in enumerate(info_embs):
-            emb_vec = np.array(emb, dtype=np.float32)
-            sim = np.dot(q_vec, emb_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(emb_vec) + 1e-12)
-            
+        info_embs = np.array(idx["info_embeddings"], dtype=np.float32)
+        sims = _cosine_sim(q_vec, info_embs)
+        for i, s in enumerate(sims):
             d = idx["info_docs"][i]
+            
+            # 리뷰 수 가중치 (0~0.2)
+            review_boost = min(d.get("review_count", 0) / 500, 0.2)  # 리뷰 500개면 최대 0.2 가산
+            
             info_results.append({
                 "product_id": d["product_id"],
-                "score": float(sim) * 0.6,
+                "score": float(s) * 0.6 + review_boost,  # 리뷰 수 반영
                 "name": d["name"],
+                "category": d.get("category"),
                 "price": d["price"],
                 "rating": d["rating"],
                 "review_count": d["review_count"],
@@ -234,23 +267,18 @@ def hybrid_search(
                 "info_snippet": d["text"][:200],
             })
     
-    # 리뷰도 동일
     review_results = []
     if idx.get("review_embeddings"):
-        review_embs = idx["review_embeddings"]
-        
-        for i, emb in enumerate(review_embs):
-            emb_vec = np.array(emb, dtype=np.float32)
-            sim = np.dot(q_vec, emb_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(emb_vec) + 1e-12)
-            
+        review_embs = np.array(idx["review_embeddings"], dtype=np.float32)
+        sims = _cosine_sim(q_vec, review_embs)
+        for i, s in enumerate(sims):
             d = idx["review_docs"][i]
             review_results.append({
                 "product_id": d["product_id"],
-                "score": float(sim) * 0.4,
+                "score": float(s) * 0.4,
                 "review_snippet": d["text"][:150],
             })
     
-    # 3. 제품별 통합
     merged = {}
     for r in info_results:
         pid = r["product_id"]
@@ -262,26 +290,44 @@ def hybrid_search(
             merged[pid]["score"] += r["score"]
             merged[pid]["review_snippet"] = r["review_snippet"]
     
-    # 4. 가격 필터
+    # 필터링
     filtered = []
     exclude_set = set(exclude_ids or [])
     
     for pid, data in merged.items():
-        if pid in exclude_set:  # 이미 추천한 제품 제외
+        if pid in exclude_set:
             continue
         
+        name = data.get("name", "")
+        
+        # 성별 필터
+        if gender_filter == "female":
+            if not name.startswith("여성"):
+                continue
+        elif gender_filter == "male":
+            if not name.startswith("남성"):
+                continue
+        else:  # neutral (기본: 남성+공용, 여성 제외)
+            if name.startswith("여성"):
+                continue
+
+        # 키워드 필터
+        if not _match_product_type(name, query):
+            continue
+        
+        # 가격 필터
         price = data.get("price")
         if min_price and (not price or price < min_price): continue
         if max_price and (not price or price > max_price): continue
+        
         filtered.append(data)
     
-    # 5. 정렬
+    # 정렬
     filtered.sort(key=lambda x: x["score"], reverse=True)
     filtered = filtered[:top_k]
     
     return filtered
 
-# ======== 모델번호 직접 검색 ========
 def search_by_model_id(model_id: str, db: Session) -> Optional[Dict[str, Any]]:
     row = db.execute(text("""
         SELECT
@@ -311,7 +357,100 @@ def search_by_model_id(model_id: str, db: Session) -> Optional[Dict[str, Any]]:
         "score": 1.0,
     }
 
-# ======== 레벨별 세트 추천 ========
+def _normalize_text(text: str) -> str:
+    """띄어쓰기 제거"""
+    return re.sub(r'\s+', '', text.lower())
+
+def search_by_name_fast(query: str, db: Session) -> Optional[Dict[str, Any]]:
+    """쿼리에 제품명 포함 시 해당 제품 반환"""
+    normalized_query = _normalize_text(query)
+    
+    if len(normalized_query) < 5:
+        return None
+    
+    rows = db.execute(text("""
+        SELECT
+            ps.product_id, ps.product_name, ps.price, ps.avg_rating,
+            ps.total_reviews, ps.url, ps.thumbnail_url, ps.category,
+            pi.explanation, pi.technical_info, pi.management_guidelines
+        FROM product_summary ps
+        LEFT JOIN product_information pi USING (product_id)
+        ORDER BY ps.total_reviews DESC
+    """)).mappings().fetchall()
+    
+    for row in rows:
+        product_name = row["product_name"] or ""
+        normalized_product = _normalize_text(product_name)
+        
+        # 제품명이 쿼리에 포함되어 있으면 매칭
+        if normalized_product in normalized_query:
+            return {
+                "product_id": row["product_id"],
+                "name": row["product_name"],
+                "price": row["price"],
+                "rating": row["avg_rating"],
+                "review_count": row["total_reviews"],
+                "url": row["url"],
+                "thumbnail_url": row["thumbnail_url"],
+                "category": row["category"],
+                "explanation": row.get("explanation"),
+                "technical_info": row.get("technical_info"),
+                "management": row.get("management_guidelines"),
+                "source": "name_match",
+                "score": 1.0,
+            }
+    
+    return None
+
+def search_by_name(product_name: str, db: Session) -> Optional[Dict[str, Any]]:
+    """제품명으로 정확 검색 (부분 매칭)"""
+    normalized_query = _normalize_text(product_name)
+    
+    if len(normalized_query) < 5:
+        return None
+    
+    rows = db.execute(text("""
+        SELECT
+            ps.product_id, ps.product_name, ps.price, ps.avg_rating,
+            ps.total_reviews, ps.url, ps.thumbnail_url, ps.category,
+            pi.explanation, pi.technical_info, pi.management_guidelines
+        FROM product_summary ps
+        LEFT JOIN product_information pi USING (product_id)
+    """)).mappings().fetchall()
+    
+    best_match = None
+    best_score = 0
+    
+    for row in rows:
+        product_name_db = row["product_name"] or ""
+        normalized_product = _normalize_text(product_name_db)
+        
+        if normalized_query in normalized_product:
+            score = len(normalized_query) / len(normalized_product)
+            if score > best_score:
+                best_score = score
+                best_match = row
+    
+    if not best_match:
+        return None
+    
+    return {
+        "product_id": best_match["product_id"],
+        "name": best_match["product_name"],
+        "price": best_match["price"],
+        "rating": best_match["avg_rating"],
+        "review_count": best_match["total_reviews"],
+        "url": best_match["url"],
+        "thumbnail_url": best_match["thumbnail_url"],
+        "category": best_match["category"],
+        "explanation": best_match.get("explanation"),
+        "technical_info": best_match.get("technical_info"),
+        "management": best_match.get("management_guidelines"),
+        "source": "name_match",
+        "score": best_score,
+    }
+    
+
 def recommend_level_set(level: str, category: str, db: Session) -> Dict[str, Any]:
     top_row = db.execute(text("""
         SELECT product_id FROM product_summary
@@ -360,13 +499,12 @@ def recommend_level_set(level: str, category: str, db: Session) -> Dict[str, Any
         }
     }
 
-# ======== 메타 ========
 def index_meta() -> Dict[str, Any]:
     try:
         idx = _load_index()
         if not idx:
             return {"error": "Index not found", "path": PKL_PATH}
-
+        
         return {
             "review_chunks": len(idx.get("review_docs", [])),
             "info_chunks": len(idx.get("info_docs", [])),
@@ -378,4 +516,4 @@ def index_meta() -> Dict[str, Any]:
     except Exception as e:
         return {"error": str(e), "path": PKL_PATH}
 
-__all__ = ["build_index_from_db", "hybrid_search", "search_by_model_id", "recommend_level_set", "index_meta"]
+__all__ = ["build_index_from_db", "hybrid_search", "search_by_model_id", "search_by_name", "search_by_name_fast", "recommend_level_set", "index_meta"]
