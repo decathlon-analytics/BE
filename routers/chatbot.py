@@ -160,7 +160,8 @@ def _classify_intent(query: str, history: List[Dict]) -> str:
     q = query.lower()
     
     # 1순위: 모델번호
-    if re.search(r"\b\d{7}\b", q):
+    model_match = re.search(r"(\d{7})", q)
+    if model_match:
         return "model_search"
     
     # 2순위: 세트 요청 (명확하게)
@@ -170,28 +171,41 @@ def _classify_intent(query: str, history: List[Dict]) -> str:
     if any(k in q for k in set_keywords):
         return "level_set"
     
-    # "100/500/900 추천" or "초심자 추천" → 세트
     if any(k in q for k in level_keywords) and "추천" in q:
         return "level_set"
     
-    # "100 알려줘" (단독 레벨만) → 세트
     if re.search(r"\b(100|500|900)\b", q) and not any(k in q for k in ["티", "자켓", "바지", "신발", "러닝", "하이킹"]):
         if any(k in q for k in ["추천", "알려", "찾아"]):
             return "level_set"
     
     # 3순위: 인기 제품
-    if any(k in q for k in ["인기", "베스트", "best", "top", "많이 팔리는", "잘 나가는", "요즘"]):
+    if any(k in q for k in ["인기", "탑", "많이 팔리는", "잘 나가는", "요즘"]):
         return "popular"
     
     # 4순위: 후속 질문
     if any(k in q for k in ["다른", "또", "더", "그 외", "다른거", "다른 거", "하나 더", "추가"]):
         return "followup"
     
-    # 5순위: 스몰톡
-    if any(k in q for k in ["안녕", "하이", "ㅎㅇ", "고마워", "감사", "땡큐", "thank"]):
+    # 5순위: 스몰톡 (제품 키워드 체크 포함)
+    greeting_keywords = ["안녕", "하이", "ㅎㅇ", "고마워", "감사", "땡큐", "thank", "hello"]
+    product_keywords = [
+        "백팩", "가방", "자켓", "신발", "티셔츠", "바지", "러닝", "하이킹", "등산",
+        "제품", "상품", "추천", "찾", "검색", "구매", "nh100", "nh", "아르페나즈"  # 🔥 "알려" 제거
+    ]
+    
+    has_greeting = any(k in q for k in greeting_keywords)
+    has_product = any(k in q for k in product_keywords)
+    
+    print(f"🔍 Query: {q}")
+    print(f"🔍 has_greeting: {has_greeting}, has_product: {has_product}")
+    
+    if has_greeting and not has_product:
+        print("🔍 Result: greeting")
         return "greeting"
     
+    print("🔍 Result: recommendation")
     return "recommendation"
+
 
 def _call_llm(system_prompt: str, messages: List[Dict[str, str]]) -> str:
     try:
@@ -210,6 +224,102 @@ SYSTEM_PROMPT = (
     "상품 정보와 리뷰를 바탕으로 2~4문장으로 간단히 답변하세요. "
     "제품명, 가격, 핵심 특징 1~2개를 자연스럽게 포함하세요."
 )
+
+def _extract_product_name_keywords(query: str) -> str:
+    """
+    사용자 쿼리에서 제품명 추출
+    1단계: 조사 제거 (가장 먼저)
+    2단계: 불필요한 문구 제거
+    """
+    
+    # 1단계: 조사 제거 (먼저 처리)
+    # "런 100에 대해서" → "런 100 대해서"
+    josa_pattern = r"(에서|에게|으로|로|와|과|이랑|랑|이나|나|만|도|조차|마저|에|은|는|을|를|이|가)(\s+|$)"
+    cleaned = re.sub(josa_pattern, " ", query)
+    
+    # 2단계: 불필요한 문구 제거
+    noise_words = [
+        "대해서", "대해", "제품", "상품", 
+        "알려줘", "알려주세요", "알려", "알려달라",
+        "추천해줘", "추천해주세요", "찾아줘", "찾아주세요", 
+        "어때", "어때요", "괜찮아", "괜찮은지", "좋아", "좋은지", 
+        "어떤지", "정보", "소개", "보여줘", "보여주세요", 
+        "있어", "있나요", "뭐야", "뭔가요", "어디", "어디서", 
+        "구매", "살", "사려고", "사고싶어", "검색"
+    ]
+    
+    for word in noise_words:
+        cleaned = cleaned.replace(word, " ")
+    
+    # 3단계: 다중 공백 제거
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    print(f"🧹 원본 쿼리: {query}")
+    print(f"🧹 정제된 제품명: {cleaned}")
+    
+    return cleaned
+
+
+def _search_product_by_name_fuzzy(query: str, db: Session):
+    """
+    제품명 유사도 검색 (정확도 높임)
+    1순위: 정확한 제품명 매칭
+    2순위: 부분 문자열 매칭 (70% 이상)
+    """
+    # 제품명 키워드 추출
+    clean_query = _extract_product_name_keywords(query)
+    
+    # 1단계: 정확 매칭 (search_by_name_fast 사용)
+    exact_match = search_by_name_fast(clean_query, db)
+    if exact_match:
+        return exact_match
+    
+    # 2단계: 부분 매칭 (PostgreSQL LIKE 또는 similarity 사용)
+    # 제품명에 쿼리의 주요 키워드가 모두 포함된 제품 찾기
+    keywords = [w for w in clean_query.split() if len(w) > 1]
+    
+    if not keywords:
+        return None
+    
+    # SQL: 모든 키워드가 제품명에 포함되어 있는지 확인
+    like_conditions = " AND ".join([f"ps.product_name ILIKE '%{kw}%'" for kw in keywords])
+    
+    sql = text(f"""
+        SELECT 
+            ps.product_id, ps.product_name, ps.price, ps.avg_rating,
+            ps.total_reviews, ps.url, ps.thumbnail_url,
+            pi.explanation, pi.technical_info, pi.management_guidelines,
+            LENGTH(ps.product_name) as name_length
+        FROM product_summary ps
+        LEFT JOIN product_information pi USING (product_id)
+        WHERE {like_conditions}
+        ORDER BY 
+            ABS(LENGTH(ps.product_name) - :query_length) ASC,  -- 🔥 쿼리 길이와 가장 유사한 제품명
+            ps.total_reviews DESC, 
+            ps.avg_rating DESC
+        LIMIT 1
+    """)
+    
+    try:
+        row = db.execute(sql, {"query_length": len(clean_query)}).mappings().first()
+        if row:
+            return {
+                "product_id": row["product_id"],
+                "name": row["product_name"],
+                "price": row.get("price"),
+                "rating": row.get("avg_rating"),
+                "review_count": row.get("total_reviews"),
+                "url": row.get("url"),
+                "explanation": row.get("explanation"),
+                "technical_info": row.get("technical_info"),
+                "management": row.get("management_guidelines"),
+            }
+    except Exception as e:
+        print(f"fuzzy search error: {e}")
+        return None
+    
+    return None
+
 
 @router.get("/health")
 def health():
@@ -268,7 +378,7 @@ def chat(
     
     # ======== 2. 모델번호 검색 ========
     if intent == "model_search":
-        model_id = re.search(r"\b(\d{7})\b", req.message).group(1)
+        model_id = re.search(r"(\d{7})", req.message).group(1)
         product = search_by_model_id(model_id, db)
         
         if not product:
@@ -505,8 +615,8 @@ def chat(
             "has_more": bool(results) if 'results' in locals() else False
         }, session_id=session_id)
     
-     # ======== 6. 일반 추천 (제품명 우선 검색) ========
-    product_match = search_by_name_fast(req.message, db)
+    # ======== 6. 일반 추천 (제품명 우선 검색) ========
+    product_match = _search_product_by_name_fuzzy(req.message, db)
     
     if product_match:
         price_str = f"{product_match.get('price'):,}원" if product_match.get('price') else "가격 미정"
@@ -518,7 +628,7 @@ def chat(
         )
         
         if product_match.get("explanation"):
-            answer += f"\n\n{product_match['explanation'][:150]}..."
+            answer += f"\n\n{product_match['explanation'][:200]}..."
         
         recs = [{
             "product_id": product_match["product_id"],
